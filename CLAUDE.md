@@ -6,57 +6,68 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ESP32-based school voting machine with RFID authentication and a WiFi web admin UI. Uses an LCD display and buzzer for local feedback. Votes are persisted via the Preferences (NVS) library.
 
-## Hardware Requirements
+## Hardware
 
-- ESP32 development board
+- ESP32 dev board
 - MFRC522 RFID reader (SPI: SS=5, RST=4)
 - 16x2 I2C LCD (address 0x27)
 - Piezo buzzer (GPIO 15)
-- RFID tags: one master card, two candidate cards per section
-
-## Pin Mapping
-
-| Component   | Pin  | Notes            |
-|-------------|------|------------------|
-| RFID SS     | 5    | MFRC522 SDA      |
-| RFID RST    | 4    | MFRC522 RST      |
-| Buzzer      | 15   | Active high      |
-| LCD         | I2C  | Default SDA/SCL  |
+- RFID tags: master card + candidate A/B cards
 
 ## WiFi (Soft AP)
 
 - SSID: `SchoolVoting`, Password: `vote1234`
 - Default IP: 192.168.4.1
-- Web UI allows changing the active voting section and resetting votes
 
 ## Build & Flash
 
-Open the `.ino` file in Arduino IDE (with ESP32 board support installed), select the correct board/port, and upload. Required libraries:
-- `MFRC522` by GitHubCommunity
+Arduino IDE with ESP32 board support. Required libraries:
+- `MFRC522` by GithubCommunity
 - `LiquidCrystal_I2C` by Frank de Brabander
-- `WiFi`, `WebServer`, `Preferences` (ESP32 built-in)
 
-To build from CLI (requires Arduino CLI or PlatformIO):
-
+CLI:
 ```bash
-# Arduino CLI
 arduino-cli compile --fqbn esp32:esp32:esp32 .
 arduino-cli upload --fqbn esp32:esp32:esp32 -p /dev/ttyUSB0 .
 ```
 
 ## Architecture
 
-The entire application is a single `.ino` file with these sections:
+Single `.ino` file, structured as:
 
-1. **Setup** — initializes LCD, RFID, SPI, Preferences NVS, WiFi soft AP, web routes, then shows locked screen
-2. **Main loop** — polls web server, checks for new RFID cards, routes based on UID and voting state
-3. **RFID flow** — master card enables voting mode (60s window), candidate card A/B registers +1 vote, any other card in voting mode shows error. Outside voting mode, tapping a non-master card shows "Machine Locked"
-4. **Sections** — 6 independent voting sections: Sports Captain, Cultural Captain, Red/Blue/Green/Yellow House. Each has its own vote tally (stored with a key prefix in NVS)
-5. **Web UI** — mobile-friendly HTML served from `handleRoot()`. Buttons to switch sections and reset votes for the current section
-6. **Persistence** — `saveVotes()`/`loadVotes()` write/read candidate A/B counts to NVS using the section key as prefix
+### State Machine (non-blocking)
+All user-visible delays are handled by `tickStateMachine()` using `millis()` comparisons — no `delay()` calls in the main loop. States:
+- `ST_LOCKED` / `ST_VOTING_READY` — wait indefinitely for RFID
+- `ST_VOTE_CONFIRMED` / `ST_INVALID_CARD` / `ST_LOCKED_ALERT` — show feedback for 2 s, then auto-lock
+- `ST_SECTION_LOADED` — show confirmation for 1.5 s, then lock
+- `ST_RESET_PENDING` — waiting for master card tap (10 s window)
+- `ST_RESET_CONFIRMED` — show confirmation for 2 s, then lock
 
-## Key Constants (configure before flash)
+### NVS Persistence
+Two Preferences namespaces:
+- `"voting"` — vote counts per section (keys: `{sectionKey}A`, `{sectionKey}B`)
+- `"uids"` — RFID UIDs (keys: `master`, `candA`, `candB`); written once with defaults on first boot, then configurable via web UI
 
-- `MASTER_UID`, `CANDIDATE_A_UID`, `CANDIDATE_B_UID` — read from actual RFID tags (see Serial output)
-- `ssid`, `password` — WiFi credentials for the soft AP
-- `currentSection`/`currentKey` — default voting section on boot (Sports Captain)
+### RFID Flow
+1. Locked → tap master → voting enabled
+2. Voting → tap candidate A/B → vote recorded → auto-lock
+3. Voting → tap invalid card → error shown → auto-lock
+4. Locked → tap non-master → "Machine Locked" alert → auto-lock
+5. Reset pending → tap master → votes reset → confirmation → lock
+
+### Web UI
+- `GET /` — full admin page with live JS polling (`/api/status` every 2 s)
+- `GET /api/status` — JSON: `section`, `sectionKey`, `votesA`, `votesB`, `state`
+- `POST /api/reset` — triggers reset-pending state (requires physical master card tap to confirm)
+- `GET/POST /api/uids` — read/update RFID card UIDs without re-flashing
+- `GET /{sectionKey}` — switch voting section
+
+### Audit Trail
+All significant actions logged to Serial with millis timestamp: `[ms] action | Section  A=N B=N`
+
+## Key Differences From a Basic Sketch
+
+- **No blocking delays** — state machine handles all timing, web server stays responsive during feedback displays
+- **Reset requires physical master card** — web UI button triggers a confirmation window; tap master card within 10 s to complete
+- **UIDs configurable via web UI** — change RFID cards without re-flashing; stored in NVS "uids" namespace
+- **Real-time web UI** — JavaScript polling updates vote counts and machine state every 2 s
